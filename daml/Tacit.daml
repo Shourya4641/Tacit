@@ -1,0 +1,261 @@
+module Tacit where
+
+-- ============================================================================
+-- Tacit -- a confidential sealed-bid venue on Canton.
+--
+-- One module on purpose: Auction's Settle exercises a choice on Bid, and Bid
+-- references Auction by ContractId. Splitting them into separate files creates
+-- a circular module import. Once it compiles you can split if you want, but for
+-- a hackathon one module is the pragmatic choice.
+--
+-- The whole privacy + settlement story lives in the signatory/observer/
+-- controller lines below. If you change any of them, re-run the authority walk
+-- before anything else -- that is where bugs hide.
+-- ============================================================================
+
+
+-- ----------------------------------------------------------------------------
+-- Holding: an asset *is* this contract. The owner is the only signatory, so
+-- "moving" an asset = archive the owner's Holding + create a new one.
+--
+-- Caveat to state to a finance judge: owner-only signatory means there is NO
+-- ledger-level conservation of value. Nothing stops Settle from creating a
+-- Holding for the wrong amount; the operator's code is trusted to write
+-- matching numbers. A token-standard registry co-signer is exactly what makes
+-- that trustless -- swap this template for the CN Token Standard's Holding
+-- when/if you adopt it (Week 2 stretch).
+-- ----------------------------------------------------------------------------
+template Holding
+  with
+    owner : Party
+    instrument : Text          -- e.g. "USD" (cash) or "ACME" (asset units)
+    amount : Decimal
+  where
+    signatory owner
+    ensure amount > 0.0
+
+    -- Ordinary transfer. Note the receiver MUST co-authorize (controller
+    -- owner, newOwner) -- this is the rule that does not exist in Solidity/Move
+    -- and the reason settlement needs the parties' signatures pre-collected.
+    choice Transfer : ContractId Holding
+      with
+        newOwner : Party
+      controller owner, newOwner
+      do create this with owner = newOwner
+
+
+-- ----------------------------------------------------------------------------
+-- ListingProposal: the seller proposes a listing; the operator accepts to
+-- co-sign the Auction. Accepting LOCKS the asset -- it archives the seller's
+-- asset Holding and records its amount inside the Auction. (Co-signing means
+-- the seller cannot silently pull the asset out mid-auction.)
+-- ----------------------------------------------------------------------------
+template ListingProposal
+  with
+    seller : Party
+    operator : Party
+    assetCid : ContractId Holding    -- the asset the seller is selling
+    cashInstrument : Text            -- currency the seller will accept, e.g. "USD"
+    reserve : Decimal                -- minimum acceptable price
+    deadline : Time
+  where
+    signatory seller
+    observer operator
+
+    choice AcceptListing : ContractId Auction
+      controller operator
+      do
+        asset <- fetch assetCid
+        assertMsg "asset must be owned by the seller" (asset.owner == seller)
+        -- authority here = {seller} (signatory) + {operator} (controller).
+        -- archiving the seller's Holding needs {seller} -- present. OK.
+        archive assetCid
+        create Auction with
+          seller
+          operator
+          assetInstrument = asset.instrument
+          assetAmount = asset.amount
+          cashInstrument
+          reserve
+          deadline
+
+    choice WithdrawListing : ()
+      controller seller
+      do pure ()
+
+
+-- ----------------------------------------------------------------------------
+-- Auction: signatory {seller, operator}. Holds the locked asset as a recorded
+-- amount. The operator settles by naming the winning Bid + the losers to refund.
+-- ----------------------------------------------------------------------------
+template Auction
+  with
+    seller : Party
+    operator : Party
+    assetInstrument : Text
+    assetAmount : Decimal
+    cashInstrument : Text
+    reserve : Decimal
+    deadline : Time
+  where
+    signatory seller, operator
+
+    -- ONE atomic settlement transaction. Read this next to the authority-tree
+    -- diagram: the seller's new cash is created in THIS scope ({seller,
+    -- operator}); the winner's asset is created inside Award, which runs in
+    -- {bidder, operator} because the bidder is a signatory of the Bid.
+    --
+    -- TRUST NOTE: the ledger cannot force the operator to pass *every* bid, so
+    -- the operator is the trust anchor for "who won". Atomicity still
+    -- guarantees nobody is cheated *at settlement*. The check below only
+    -- enforces that the named winner beats the bids the operator chose to show.
+    choice Settle : SettleResult
+      with
+        winningBidCid : ContractId Bid
+        losingBidCids : [ContractId Bid]
+      controller operator
+      do
+        now <- getTime
+        assertMsg "deadline has not passed yet" (now >= deadline)
+
+        winning <- fetch winningBidCid
+        assertMsg "winning bid is for a different auction" (winning.auctionCid == self)
+        assertMsg "winning bid is below reserve" (winning.cashAmount >= reserve)
+        assertMsg "winning bid currency mismatch" (winning.cashInstrument == cashInstrument)
+
+        -- sanity: the named winner must beat every refunded loser
+        losers <- mapA fetch losingBidCids
+        let tooHigh = filter (\l -> l.cashAmount > winning.cashAmount) losers
+        assertMsg "a losing bid was higher than the named winner" (null tooHigh)
+
+        -- leg 1, outer {seller, operator} scope: seller receives the cash
+        sellerCash <- create Holding with
+          owner = seller
+          instrument = cashInstrument
+          amount = winning.cashAmount
+
+        -- leg 2, nested {bidder, operator} scope (Award on the winning Bid):
+        -- winner receives the asset; the winning Bid is consumed.
+        winnerAsset <- exercise winningBidCid Award with
+          assetInstrument
+          assetAmount
+
+        -- refunds: each runs in its own nested {loser, operator} scope
+        refundCids <- mapA (`exercise` Refund) losingBidCids
+
+        pure SettleResult with sellerCash; winnerAsset; refundCids
+
+    -- Seller reclaims the asset if the auction expired with no valid sale.
+    choice Reclaim : ContractId Holding
+      controller seller, operator
+      do
+        now <- getTime
+        assertMsg "cannot reclaim before the deadline" (now >= deadline)
+        create Holding with
+          owner = seller
+          instrument = assetInstrument
+          amount = assetAmount
+
+
+-- ----------------------------------------------------------------------------
+-- BidProposal: the bidder proposes a funded bid; the operator accepts to
+-- co-sign the Bid. Accepting LOCKS the cash -- archives the bidder's cash
+-- Holding, records the amount in the Bid. (Co-signing makes a funded bid
+-- binding: the bidder cannot silently withdraw after the deadline.)
+-- ----------------------------------------------------------------------------
+template BidProposal
+  with
+    bidder : Party
+    operator : Party
+    auctionCid : ContractId Auction
+    cashCid : ContractId Holding     -- the funding cash; must equal the price
+    price : Decimal
+  where
+    signatory bidder
+    observer operator
+
+    choice AcceptBid : ContractId Bid
+      controller operator
+      do
+        auction <- fetch auctionCid
+        cash <- fetch cashCid
+        assertMsg "cash must be owned by the bidder" (cash.owner == bidder)
+        assertMsg "bid is not fully funded" (cash.amount == price)
+        assertMsg "wrong currency for this auction" (cash.instrument == auction.cashInstrument)
+        archive cashCid
+        create Bid with
+          bidder
+          operator
+          auctionCid
+          cashInstrument = auction.cashInstrument
+          cashAmount = price
+
+    choice RejectBid : ()
+      controller operator
+      do pure ()
+
+    choice WithdrawBid : ()
+      controller bidder
+      do pure ()
+
+
+-- ----------------------------------------------------------------------------
+-- Bid: signatory {bidder, operator}. Stakeholders are EXACTLY these two, so
+-- rival bidders are not stakeholders and Canton never delivers this contract
+-- to them. That single line is your entire privacy claim.
+--
+-- The "conditional approve" is not a flag: the bidder's authority is available
+-- inside Award/Refund purely because the bidder is a signatory of this Bid.
+-- ----------------------------------------------------------------------------
+template Bid
+  with
+    bidder : Party
+    operator : Party
+    auctionCid : ContractId Auction
+    cashInstrument : Text
+    cashAmount : Decimal
+  where
+    signatory bidder, operator
+
+    -- Winner takes delivery of the asset. Runs in {bidder, operator} scope.
+    choice Award : ContractId Holding
+      with
+        assetInstrument : Text
+        assetAmount : Decimal
+      controller operator
+      do
+        create Holding with
+          owner = bidder
+          instrument = assetInstrument
+          amount = assetAmount
+
+    -- Loser: cash returns to the bidder; the Bid is consumed.
+    choice Refund : ContractId Holding
+      controller operator
+      do
+        create Holding with
+          owner = bidder
+          instrument = cashInstrument
+          amount = cashAmount
+
+
+data SettleResult = SettleResult
+  with
+    sellerCash : ContractId Holding
+    winnerAsset : ContractId Holding
+    refundCids : [ContractId Holding]
+  deriving (Eq, Show)
+
+
+-- ============================================================================
+-- TODOs (decisions named in the build brief -- cheap now, annoying later):
+--  * Tie-break rule: equal high bids -> earliest? Decide and enforce in Settle.
+--  * Amount splitting: this skeleton assumes exact amounts (cash == price, one
+--    asset Holding). Real bids rarely match exactly -> add split/merge on
+--    Holding, or require exact funding (current behaviour).
+--  * Bid set completeness: Settle trusts the operator to pass all bids. If you
+--    want stronger guarantees, have the operator pass the full set and assert
+--    the winner is the max -- still operator-supplied, but auditable.
+--  * Stuck cash: if an Auction never settles and never expires, locked cash has
+--    no exit. Add an operator-approved cancel path if you care for the demo.
+-- ============================================================================

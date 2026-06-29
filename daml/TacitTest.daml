@@ -1,0 +1,139 @@
+module TacitTest where
+
+import Daml.Script
+import Tacit
+import DA.Time (hours, addRelTime)
+import DA.Optional (isSome, isNone)
+
+-- ============================================================================
+-- Week-1 proof harness. Runs entirely in-memory via Daml Script -- no Canton,
+-- no LocalNet. Run with:  daml test    (or "Script results" in the IDE)
+--
+-- Cast: 1 seller (Sasha), 3 bidders (Bob, Carol, Dave), 1 operator (Op).
+-- Holdings are self-issued for the demo -- no real issuer/registry yet.
+-- ============================================================================
+
+data Parties = Parties
+  with
+    sasha : Party
+    op : Party
+    bob : Party
+    carol : Party
+    dave : Party
+
+setupParties : Script Parties
+setupParties = do
+  sasha <- allocateParty "Sasha"
+  op    <- allocateParty "Op"
+  bob   <- allocateParty "Bob"
+  carol <- allocateParty "Carol"
+  dave  <- allocateParty "Dave"
+  pure Parties with ..
+
+-- bidder proposes a funded bid; operator accepts -> Bid (cash locked)
+acceptBid : Party -> Party -> ContractId Auction -> ContractId Holding -> Decimal -> Script (ContractId Bid)
+acceptBid operator bidder auctionCid cashCid price = do
+  bp <- submit bidder do
+    createCmd BidProposal with bidder; operator; auctionCid; cashCid; price
+  submit operator do exerciseCmd bp AcceptBid
+
+
+-- ----------------------------------------------------------------------------
+-- Happy path: list -> 3 funded bids -> settle. Carol (110) wins.
+-- Proves claim (b) atomic settlement and claim (c) refunds.
+-- ----------------------------------------------------------------------------
+testHappyPath : Script ()
+testHappyPath = do
+  p@Parties{..} <- setupParties
+
+  now <- getTime
+  let deadline = addRelTime now (hours 1)
+
+  -- self-issued holdings
+  asset   <- submit sasha do createCmd Holding with owner = sasha; instrument = "ACME"; amount = 100.0
+  bobCash <- submit bob   do createCmd Holding with owner = bob;   instrument = "USD";  amount = 90.0
+  carCash <- submit carol do createCmd Holding with owner = carol; instrument = "USD";  amount = 110.0
+  davCash <- submit dave  do createCmd Holding with owner = dave;  instrument = "USD";  amount = 100.0
+
+  -- Sasha lists; Op accepts -> Auction (asset locked)
+  lp <- submit sasha do
+    createCmd ListingProposal with
+      seller = sasha; operator = op; assetCid = asset
+      cashInstrument = "USD"; reserve = 80.0; deadline
+  auction <- submit op do exerciseCmd lp AcceptListing
+
+  -- three funded bids
+  bobBid <- acceptBid op bob   auction bobCash 90.0
+  carBid <- acceptBid op carol auction carCash 110.0
+  davBid <- acceptBid op dave  auction davCash 100.0
+
+  -- NEGATIVE: cannot settle before the deadline
+  submitMustFail op do
+    exerciseCmd auction Settle with winningBidCid = carBid; losingBidCids = [bobBid, davBid]
+
+  passTime (hours 2)
+
+  -- NEGATIVE: a non-operator cannot settle
+  submitMustFail bob do
+    exerciseCmd auction Settle with winningBidCid = carBid; losingBidCids = [bobBid, davBid]
+
+  -- Op settles: Carol (110) wins; Bob + Dave refunded. One atomic transaction.
+  res <- submit op do
+    exerciseCmd auction Settle with winningBidCid = carBid; losingBidCids = [bobBid, davBid]
+
+  -- (b) atomic settlement: Carol holds the asset AND Sasha holds the cash
+  carolAsset <- queryContractId carol res.winnerAsset
+  assertMsg "Carol should own the ACME after settle" (isSome carolAsset)
+  sashaCash <- queryContractId sasha res.sellerCash
+  assertMsg "Sasha should own the cash after settle" (isSome sashaCash)
+
+  -- (c) refunds: Bob got his 90 back
+  bobHoldings <- query @Holding bob
+  assertMsg "Bob should have been refunded 90"
+    (any (\(_, h) -> h.owner == bob && h.amount == 90.0) bobHoldings)
+
+  pure ()
+
+
+-- ----------------------------------------------------------------------------
+-- Claim (a) PRIVACY: a rival bidder cannot see another bidder's Bid.
+-- This is the demo's headline and the hardest thing to make visible.
+-- ----------------------------------------------------------------------------
+testBidPrivacy : Script ()
+testBidPrivacy = do
+  Parties{..} <- setupParties
+
+  now <- getTime
+  let deadline = addRelTime now (hours 1)
+
+  asset   <- submit sasha do createCmd Holding with owner = sasha; instrument = "ACME"; amount = 100.0
+  bobCash <- submit bob   do createCmd Holding with owner = bob;   instrument = "USD";  amount = 90.0
+  carCash <- submit carol do createCmd Holding with owner = carol; instrument = "USD";  amount = 110.0
+
+  lp <- submit sasha do
+    createCmd ListingProposal with
+      seller = sasha; operator = op; assetCid = asset
+      cashInstrument = "USD"; reserve = 80.0; deadline
+  auction <- submit op do exerciseCmd lp AcceptListing
+
+  bobBid <- acceptBid op bob   auction bobCash 90.0
+  carBid <- acceptBid op carol auction carCash 110.0
+
+  -- Bob sees his own bid, NOT Carol's
+  bobsView <- query @Bid bob
+  assertMsg "Bob must see his own bid"     (any (\(cid, _) -> cid == bobBid) bobsView)
+  assertMsg "Bob must NOT see Carol's bid" (not (any (\(cid, _) -> cid == carBid) bobsView))
+
+  -- Carol cannot even fetch Bob's bid by id
+  bobBidForCarol <- queryContractId carol bobBid
+  assertMsg "Carol must not see Bob's bid contents" (isNone bobBidForCarol)
+
+  -- The seller does NOT see bids either (not a stakeholder on Bid)
+  sellerView <- query @Bid sasha
+  assertMsg "Seller must not see any bids" (null sellerView)
+
+  -- The operator (the venue) sees the whole book
+  opView <- query @Bid op
+  assertMsg "Operator should see both bids" (length opView == 2)
+
+  pure ()
