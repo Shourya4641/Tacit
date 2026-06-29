@@ -1,1 +1,1 @@
-# Tacit
+# Tacit - Private DeFi & Capital Markets
